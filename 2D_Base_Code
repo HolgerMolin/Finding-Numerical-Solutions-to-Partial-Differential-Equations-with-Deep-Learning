@@ -1,0 +1,350 @@
+import matplotlib.pyplot as plt
+import numpy as np
+from tqdm import trange
+from torch import optim
+from functools import reduce
+import scipy.special as sc
+import torch
+import deepxde as dde
+from deepxde.backend import torch
+from tqdm import trange
+from torch import optim
+from functools import reduce
+import scipy.special as sc
+
+from DGM.first_net import Net
+
+m = 1.0
+hardbc = False
+nBatch = 2**14
+
+# Ornstein-Uhlenbeck in (-1,1)
+
+def pde(x, y):
+
+    b = 1.0
+
+    dy_x = dde.grad.jacobian(y, x)
+    dy_x1x1 = dde.grad.hessian(y, x, grad_y=dy_x, i=0, j=0)
+    dy_x2_x2 = dde.grad.hessian(y, x, grad_y=dy_x, i=1,j=1)
+    laplacian = dy_x1x1 + dy_x2_x2
+
+    return lam * y - b * torch.sum(x * dy_x, dim=1) + 0.5 * laplacian - y * b
+
+def generate_domain(num_points):
+    circle_points = []
+    while len(circle_points) < num_points:
+        x = torch.empty(num_points - len(circle_points), 1).uniform_(-1, 1)
+        y = torch.empty(num_points - len(circle_points), 1).uniform_(-1, 1)
+        points = torch.cat((x, y), dim=1)
+        distances = torch.norm(points, dim=1)
+        mask = distances <= 0.5
+        circle_points.extend(points[mask])
+    return torch.stack(circle_points)[:num_points].requires_grad_(True)
+
+def generate_boundary(num_points):
+    theta = torch.linspace(0, 2 * np.pi, num_points)
+    x = torch.cos(theta)/2
+    y = torch.sin(theta)/2
+    points = torch.stack((x, y), dim=1)
+    return points.requires_grad_(True)
+
+'''
+def generate_domain(num_points):
+    points_per_side = int(np.sqrt(num_points))
+    spacing = 1 / points_per_side
+
+    xs = []
+    ys = []
+
+    for i in range(points_per_side):
+        for j in range(points_per_side):
+            x = (i + 0.5) * spacing - 0.5
+            y = (j + 0.5) * spacing - 0.5
+            xs.append(x)
+            ys.append(y)
+
+    return torch.tensor([xs, ys], requires_grad=True)
+
+def generate_boundary(num_points):
+    half_side_length = 1 / 2
+
+    # Calculate the number of points per side
+    points_per_side = num_points // 4
+
+    # Generate the boundary points
+    points = []
+    points.extend([(half_side_length, y) for y in np.linspace(-half_side_length, half_side_length, points_per_side)])
+    points.extend([(-half_side_length, y) for y in np.linspace(-half_side_length, half_side_length, points_per_side)])
+    points.extend([(x, half_side_length) for x in np.linspace(-half_side_length, half_side_length, points_per_side)])
+    points.extend([(x, -half_side_length) for x in np.linspace(-half_side_length, half_side_length, points_per_side)])
+
+    # Convert the points to a tensor
+    points_tensor = torch.tensor(points, requires_grad=True)
+
+    return points_tensor'''
+
+
+def weight_annealing(weights, u, x, bcu, iteration):
+
+  Z = (0.5**2) * np.pi * torch.mean(u)
+  net_parameters = list(net.parameters())
+  if iteration > 500:
+    alpha = 0.9
+  else:
+    alpha = 1
+
+  density_weight = weights[0]
+  bc_weight = weights[1]
+
+
+  density_loss = (Z - 1)**2
+  density_loss = torch.mean(density_loss)
+
+  pde_loss =  pde(x, u)**2
+  pde_loss = torch.mean(pde_loss)
+
+  bc_loss = torch.mean(bcu**2)
+
+  pde_grad = torch.autograd.grad(pde_loss, net.parameters(), retain_graph=True)[0]
+  density_grad = torch.autograd.grad(density_loss, net.parameters(), retain_graph=True)[0]
+  bc_grad = torch.autograd.grad(bc_loss, net.parameters(), retain_graph=True)[0]
+
+  lambda_hat_density = torch.max(torch.abs(pde_grad))/torch.mean(torch.abs(density_grad))
+  new_density_weight = alpha * density_weight + (1-alpha) * lambda_hat_density
+
+  lambda_hat_bc = torch.max(torch.abs(pde_grad))/torch.mean(torch.abs(bc_grad))
+  new_bc_weight = alpha * bc_weight + (1-alpha) * lambda_hat_bc
+
+  if new_density_weight > 100000:
+    new_density_weight = 100000
+  if new_bc_weight > 100000:
+    new_bc_weight = 100000
+
+  return torch.tensor([new_density_weight, new_bc_weight])
+
+
+# Physics-informed loss
+
+def lossfn(x, u, bcu, Z, weights):
+    #if Z is None:
+    #    Z = m*torch.mean(u)
+    #else:
+    #    Z = 0.2 * Z.detach() + 0.8 * m*torch.mean(u)
+
+    #Z = 2 * m * torch.mean(u)
+
+    Z = (0.5**2) * np.pi * torch.mean(u)
+
+    density = (Z - 1)**2
+    pdeloss =  torch.mean(pde(x, u)**2)
+    bc = torch.mean(bcu**2)
+
+    considered_loss = [density * weights[0], pdeloss, bc * weights[1]]
+    comparison_loss = [density, pdeloss, bc]
+
+    return reduce(lambda a, b: a + b, considered_loss), considered_loss, Z, comparison_loss, reduce(lambda a, b: a + b, comparison_loss)
+
+'''# NN wrapper that imposes soft or hard Dirichlet (=0) boundary conditions
+
+class ConstraintAdapter(dde.nn.NN):
+    def __init__(self, subnn, hardbc=False):
+        super(ConstraintAdapter, self).__init__()
+        self.subnn = subnn
+        self.hardbc = hardbc
+
+    def forward(self, inputs):
+        x = self.subnn(inputs)
+        x = x ** 2
+        if self.hardbc:
+            return torch.lt(inputs, m) * torch.gt(inputs, 0) * x
+        else:
+            return x
+
+class ModelAdapter(dde.nn.NN):
+    def __init__(self, subnn):
+        super(ModelAdapter, self).__init__()
+        self.subnn = subnn
+
+    def forward(self, inputs):
+        #print(inputs.shape)
+        x = inputs[None, :]
+        #print(x.shape)
+        return torch.squeeze(self.subnn(x), dim=0)
+
+layer_size = [2] + [64] * 3  + [1]
+activation = "tanh"
+initializer = "Glorot uniform"
+net = dde.nn.FNN(layer_size, activation, initializer)
+'''
+
+# NN wrapper that imposes soft or hard Dirichlet (=0) boundary conditions
+
+class ConstraintAdapter(dde.nn.NN):
+    def __init__(self, subnn, hardbc=False):
+        super(ConstraintAdapter, self).__init__()
+        self.subnn = subnn
+        self.hardbc = hardbc
+
+    def forward(self, inputs):
+        x = self.subnn(inputs)
+        x = x ** 2
+        if self.hardbc:
+            return torch.lt(inputs, m) * torch.gt(inputs, 0) * x
+        else:
+            return x
+
+torch.manual_seed(0)
+
+lam = torch.tensor(1.0, requires_grad=True)
+
+net = Net(in_size=2, out_size=1, neurons=64, depth=3)
+
+
+total_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
+print(f'Total params: {total_params}')
+
+geom = dde.geometry.Interval(-m, m)
+Z = None
+
+parameters = list(net.parameters()) + [lam]
+
+opt = optim.AdamW(params=parameters, lr=1.0e-2, weight_decay=0.001) #weight_decay=0.001, betas=(0.99,0.99)
+
+x = generate_domain(nBatch)
+#x = x[0, :].reshape(4096, 1)
+#x = torch.transpose(x,0,1)
+
+
+#print(x.shape)
+
+weights = torch.tensor([2, 1])
+
+density_weights = []
+bc_weights = []
+
+bcx = generate_boundary(nBatch).to(torch.float32)
+#bcx = torch.transpose(bcx, 0, 1)
+
+nIterations = 10000
+display_every = 500 #1000
+losses = torch.zeros((nIterations, 4))
+comparison_losses = torch.zeros((nIterations, 4))
+
+lams = torch.zeros((nIterations, 1))
+
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=200, factor=0.9)
+
+iterations = trange(nIterations)
+for i in iterations:
+    opt.zero_grad()
+    u = net.forward(x)
+    bcu = net.forward(bcx)
+    loss, terms, Z, comparison_loss, comparison_total = lossfn(x, u, bcu, Z, weights)
+
+    for j in range(3):
+        losses[i,j] = terms[j]
+    for j in range(3):
+      comparison_losses[i,j] = comparison_loss[j]
+    losses[i,3] = loss.item()
+    comparison_losses[i,3] = comparison_total.item()
+    lams[i] = lam**2
+
+    termstring = " ".join([f't{i+1}:{val.item():.2e}' for i, val in enumerate(terms) ])
+    lr = opt.param_groups[0]['lr']
+    lrString = f'{lr:.2e}'
+    iterations.set_description(f'loss: {loss.item():.2e}, Z: {Z.item():.2e}, lambda: {(lam**2).item():.2e}, {termstring}, lr {lrString}', refresh=True)
+
+    '''
+    weights = weight_annealing(weights, u, x, bcu, i)
+    density_weights.append(weights[0].detach().cpu())
+    bc_weights.append(weights[1].detach().cpu())'''
+
+    loss.backward()
+    opt.step()
+    scheduler.step(loss)
+
+    # Plotting
+    if i % display_every == 0:
+        fig = plt.figure(figsize=(12,8))
+
+        print("Losses:")
+        print(comparison_losses[i, 0])
+        print(comparison_losses[i, 1])
+        print(comparison_losses[i, 2])
+        print(comparison_losses[i, 3])
+
+
+        xd = x.detach().cpu()
+
+        x1 = xd[:,0]
+        x2 = xd[:,1]
+        u1 = u.detach().cpu()
+
+        ax = fig.add_subplot(231, projection='3d')
+
+
+        ax.scatter(x1,x2,u1, label='NN', c=u1, cmap='viridis')
+        #axs[0].plot(xd, func(xd), label='Real')
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Probability Density')
+
+
+
+        axs1 = fig.add_subplot(232)
+        axs1.plot(losses[0:i, 0].detach().cpu(), label='density')
+        axs1.plot(losses[0:i, 1].detach().cpu(), label='pde')
+        axs1.plot(losses[0:i, 2].detach().cpu(), label='bc')
+        axs1.plot(losses[0:i, 3].detach().cpu(), label='all')
+
+
+        axs1.set_yscale('log')
+        axs1.legend()
+        axs1.set_title('Losses')
+
+        axs2 = fig.add_subplot(233)
+        axs2.set_xlabel('Iteration')
+
+        axs2.plot(lams[0:i,0].detach().cpu())
+        axs2.set_title('Eigenvalue')
+        axs2.set_xlabel('Iteration')
+
+
+        axs3 = fig.add_subplot(234)
+        axs3.set_xlabel('Comparison loss')
+
+        axs3.plot(comparison_losses[0:i, 0].detach().cpu(), label='density')
+        axs3.plot(comparison_losses[0:i, 1].detach().cpu(), label='pde')
+        axs3.plot(comparison_losses[0:i, 2].detach().cpu(), label='bc')
+        axs3.plot(comparison_losses[0:i, 3].detach().cpu(), label='all')
+        axs3.set_title('Comparison Losses')
+        axs3.set_xlabel('Iteration')
+        axs3.set_yscale('log')
+        axs3.legend()
+        '''
+        axs4 = fig.add_subplot(235)
+        axs4.set_xlabel("Loss Weights")
+        axs4.plot(density_weights, label='density')
+        axs4.plot(bc_weights, label='bc')
+        axs4.set_title('Weight progression')
+        axs4.legend()
+        axs4.set_yscale('log')'''
+
+
+
+
+        plt.tight_layout()
+
+
+        plt.show()
+
+
+
+print("Losses:")
+print(comparison_losses[nIterations-1, 0])
+print(comparison_losses[nIterations-1, 1])
+print(comparison_losses[nIterations-1, 2])
+print(comparison_losses[nIterations-1, 3])
+
+
